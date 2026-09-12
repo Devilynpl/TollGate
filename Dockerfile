@@ -10,11 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .env.example ./
+COPY pyproject.toml .env.example README.md ./
+COPY app/ ./app/
+
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -e .
 
-COPY app/ ./app/
 COPY docs/ ./docs/
 COPY examples/ ./examples/
 RUN mkdir -p data logs
