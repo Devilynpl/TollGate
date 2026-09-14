@@ -19,22 +19,24 @@ from app.cache import semantic_cache
 from app.router import model_router
 from app.tracing import trace_recorder
 from app.providers.gemini import GeminiProvider, ProviderError
+from app.providers.bedrock import BedrockProvider
 from app.config import settings
 
 logger = logging.getLogger("tollgate.api")
 router = APIRouter()
 
 guardrails = GuardrailEngine()
-provider = GeminiProvider()
+gemini_provider = GeminiProvider()
+bedrock_provider = BedrockProvider()
 
 
 @router.get("/health", tags=["System"])
 async def health():
+    # SECURITY FIX (HIGH-01): Do NOT expose budget details or infra config on public /health.
+    # Load-balancers only need status=ok.
     return {
         "status": "ok",
         "service": "tollgate",
-        "gemini_model": settings.gemini_model,
-        "daily_tokens_remaining": budget_tracker.get_summary().token_cap_remaining,
     }
 
 
@@ -126,6 +128,7 @@ async def chat(request: ChatRequest, response: Response, background_tasks: Backg
 
     # 5. SEMANTIC CACHE PATH (DocGround FAQ / Knowledge lookups)
     corpus_version = str(request.metadata.get("corpus_version", "v1")) if request.metadata else "v1"
+    tenant_id = str(request.metadata.get("tenant_id", "default")) if request.metadata else "default"
     user_query = ""
     for m in reversed(request.messages):
         if m.role == "user":
@@ -133,8 +136,15 @@ async def chat(request: ChatRequest, response: Response, background_tasks: Backg
             break
 
     if target_route == "cache" and user_query:
-        query_emb = await provider.get_embedding(user_query)
-        match = semantic_cache.find_match(query_emb, corpus_version=corpus_version)
+        # SECURITY FIX (HIGH-02): Was `provider` (undefined → NameError). Fixed to gemini_provider.
+        query_emb = await gemini_provider.get_embedding(user_query)
+        # SECURITY FIX: Tenant and App isolation in semantic cache
+        match = semantic_cache.find_match(
+            query_emb,
+            corpus_version=corpus_version,
+            app=request.app,
+            tenant_id=tenant_id
+        )
         if match:
             cached_text, sim = match
             latency_ms = (time.time() - start_time) * 1000
@@ -154,32 +164,71 @@ async def chat(request: ChatRequest, response: Response, background_tasks: Backg
             _record_and_log_trace(trace_id, request, chat_resp, prompt_snippet)
             return chat_resp
 
-    # 6. LIVE GEMINI PROVIDER PATH
+    # 6. LIVE MULTI-CLOUD PROVIDER PATH (Gemini + AWS Bedrock)
     try:
         dict_messages = [{"role": m.role, "content": m.content} for m in request.messages]
-        gen_text, in_tok, out_tok = await provider.generate(
-            messages=dict_messages,
-            tools=request.tools,
-            timeout=settings.request_timeout_seconds,
-        )
+        used_route = "gemini"
+        route_detail = route_reason if target_route != "cache" else "cache_miss: querying LLM live"
+
+        # Determine if Bedrock should be preferred or requested
+        prefer_bedrock = (
+            request.force_route == "bedrock"
+            or settings.active_llm_provider == "bedrock"
+        ) and bedrock_provider.is_configured()
+
+        if prefer_bedrock:
+            used_route = "bedrock"
+            route_detail = "provider_route: AWS Bedrock Claude 3.5 Sonnet"
+            gen_text, in_tok, out_tok = await bedrock_provider.generate(
+                messages=dict_messages,
+                tools=request.tools,
+                timeout=settings.request_timeout_seconds,
+            )
+        else:
+            try:
+                gen_text, in_tok, out_tok = await gemini_provider.generate(
+                    messages=dict_messages,
+                    tools=request.tools,
+                    timeout=settings.request_timeout_seconds,
+                )
+            except ProviderError as pe:
+                # Multi-Cloud Failover: If Gemini is rate-limited or fails, seamlessly failover to AWS Bedrock!
+                if bedrock_provider.is_configured():
+                    logger.warning(f"Gemini failed ({pe.code}), executing Multi-Cloud Failover to AWS Bedrock...")
+                    used_route = "bedrock_failover"
+                    route_detail = f"multi_cloud_failover: Gemini ({pe.code}) -> AWS Bedrock Claude"
+                    gen_text, in_tok, out_tok = await bedrock_provider.generate(
+                        messages=dict_messages,
+                        tools=request.tools,
+                        timeout=settings.request_timeout_seconds,
+                    )
+                else:
+                    raise pe
 
         cost = budget_tracker.record_usage(request.app, in_tok, out_tok)
         latency_ms = (time.time() - start_time) * 1000
 
+        # SECURITY FIX (ADV-02): Output Guardrail Inspection
+        gen_text, was_redacted = guardrail_engine.inspect_and_sanitize_output(gen_text)
+        if was_redacted:
+            logger.warning(f"Trace {trace_id}: Output contained sensitive data and was sanitized by output guardrail.")
+
         # Store in semantic cache if app is docground and response is valid
         if request.app == "docground" and user_query and gen_text and len(gen_text) > 10:
-            query_emb = await provider.get_embedding(user_query)
+            query_emb = await gemini_provider.get_embedding(user_query)
             semantic_cache.store(
                 query_text=user_query,
                 corpus_version=corpus_version,
                 query_embedding=query_emb,
                 response_text=gen_text,
+                app=request.app,
+                tenant_id=tenant_id,
             )
 
         chat_resp = ChatResponse(
             text=gen_text,
-            route="gemini",
-            route_reason=route_reason if target_route != "cache" else "cache_miss: querying Gemini live",
+            route=used_route,
+            route_reason=route_detail,
             cached=False,
             cache_similarity=None,
             guardrail=None,

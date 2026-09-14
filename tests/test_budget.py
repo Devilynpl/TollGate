@@ -8,8 +8,8 @@ from app.budget import BudgetTracker
 
 
 def test_rpm_limit():
-    # Setup tracker with RPM = 5
-    tracker = BudgetTracker(rpm_limit=5)
+    # Setup tracker with RPM = 5 and in-memory DB
+    tracker = BudgetTracker(rpm_limit=5, db_path=":memory:")
 
     # 5 requests should pass
     for _ in range(5):
@@ -20,8 +20,8 @@ def test_rpm_limit():
 
 
 def test_daily_token_and_cost_cap():
-    # Setup tracker with 1000 tokens limit and $0.05 limit
-    tracker = BudgetTracker(daily_token_cap=1000, daily_usd_cap=0.05, rpm_limit=100)
+    # Setup tracker with 1000 tokens limit and $0.05 limit and in-memory DB
+    tracker = BudgetTracker(daily_token_cap=1000, daily_usd_cap=0.05, rpm_limit=100, db_path=":memory:")
 
     # Initial budget is available
     assert tracker.check_daily_budget(est_new_tokens=500) is True
